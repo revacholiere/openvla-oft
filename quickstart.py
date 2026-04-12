@@ -1,28 +1,25 @@
 import pickle
 
 from experiments.robot.libero.run_libero_eval import GenerateConfig
-from experiments.robot.openvla_utils import (
-    get_action_head,
-    get_processor,
-    get_proprio_projector,
-    get_vla,
-    get_vla_action,
-)
+from experiments.robot.openvla_utils import get_processor, get_proprio_projector, get_vla, get_vla_action
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK, PROPRIO_DIM
+from skip import test_layer_skipping
+
+# ===== Main Script =====
 
 # Instantiate config (see class GenerateConfig in experiments/robot/libero/run_libero_eval.py for definitions)
 cfg = GenerateConfig(
-    pretrained_checkpoint = "moojink/openvla-7b-oft-finetuned-libero-spatial",
-    use_l1_regression = False,
-    use_diffusion = False,
-    use_film = False,
-    num_images_in_input = 2,
-    use_proprio = True,
-    load_in_8bit = False,
-    load_in_4bit = False,
-    center_crop = True,
-    num_open_loop_steps = NUM_ACTIONS_CHUNK,
-    unnorm_key = "libero_spatial_no_noops",
+    pretrained_checkpoint="moojink/openvla-7b-oft-finetuned-libero-spatial",
+    use_l1_regression=False,
+    use_diffusion=False,
+    use_film=False,
+    num_images_in_input=2,
+    use_proprio=True,
+    load_in_8bit=False,
+    load_in_4bit=False,
+    center_crop=True,
+    num_open_loop_steps=NUM_ACTIONS_CHUNK,
+    unnorm_key="libero_spatial_no_noops",
 )
 
 # Load OpenVLA-OFT policy and inputs processor
@@ -30,7 +27,7 @@ vla = get_vla(cfg)
 processor = get_processor(cfg)
 
 # Load MLP action head to generate continuous actions (via L1 regression)
-#action_head = get_action_head(cfg, llm_dim=vla.llm_dim)
+# action_head = get_action_head(cfg, llm_dim=vla.llm_dim)
 
 # Load proprio projector to map proprio to language embedding space
 proprio_projector = get_proprio_projector(cfg, llm_dim=vla.llm_dim, proprio_dim=PROPRIO_DIM)
@@ -47,9 +44,12 @@ with open("experiments/robot/libero/sample_libero_spatial_observation.pkl", "rb"
 
 # Generate robot action chunk (sequence of future actions)
 actions = get_vla_action(
-    cfg, vla, processor, observation, observation["task_description"],
-    proprio_projector=proprio_projector
+    cfg, vla, processor, observation, observation["task_description"], proprio_projector=proprio_projector
 )
 print("Generated action chunk:")
 for act in actions:
     print(act)
+
+# ===== Run Layer Skipping Test =====
+# Uncomment the line below to run the self-speculative decoding layer skipping test
+test_layer_skipping(vla, cfg, processor, observation, proprio_projector)
