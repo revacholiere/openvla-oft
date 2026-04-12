@@ -117,9 +117,11 @@ greedy_result = greedy.run(evaluator=evaluator, verbose=True)
 print(f"Best greedy metric ({greedy_metric_name}): {greedy_result.best_trial.objective_value:.6f}")
 print(f"Best greedy skip layers: {sorted(greedy_result.best_trial.skip_layers)}")
 
-print("\nGreedy timeline:")
-for trial in greedy_result.history:
-    print(
-        f"step={trial.iteration:02d} active={trial.active_layers:02d} "
-        f"skip={sorted(trial.skip_layers)} {greedy_metric_name}={trial.metrics[greedy_metric_name]:.6f}"
-    )
+chosen_order = []
+for prev_trial, curr_trial in zip(greedy_result.history[:-1], greedy_result.history[1:]):
+    newly_added = curr_trial.skip_layers - prev_trial.skip_layers
+    if newly_added:
+        chosen_order.extend(sorted(newly_added))
+
+print("\nGreedy skip order (one row):")
+print(" -> ".join(str(layer) for layer in chosen_order))
