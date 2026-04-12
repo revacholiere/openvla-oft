@@ -68,6 +68,9 @@ def patch_layer_skipping(vla: torch.nn.Module, skip_layer_indices: set):
 def compute_action_metrics(
     original_actions: List[np.ndarray],
     skipped_actions: List[np.ndarray],
+    action_low: Optional[np.ndarray] = None,
+    action_high: Optional[np.ndarray] = None,
+    n_action_bins: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Compute metrics comparing original and layer-skipped actions.
@@ -77,7 +80,7 @@ def compute_action_metrics(
         skipped_actions: List of action arrays from layer-skipped model
 
     Returns:
-        Dictionary with metrics: l2_mean, l2_max, l2_std, value_diff_mean, value_diff_max, anomalies, etc.
+        Dictionary with metrics: l2 stats, value-diff stats, anomaly flags, and optional bin-index distance stats.
     """
     # Stack actions for easier computation
     orig_arr = np.array(original_actions)  # Shape: (num_actions, action_dim)
@@ -105,6 +108,29 @@ def compute_action_metrics(
     metrics["has_nan"] = has_nan
     metrics["has_inf"] = has_inf
     metrics["has_extremes"] = extremes
+
+    # Optional token-bin index distance metrics.
+    # We map unnormalized actions -> normalized [-1, 1] -> nearest bin index in [0, n_action_bins-1].
+    if action_low is not None and action_high is not None and n_action_bins is not None and n_action_bins > 1:
+        denom = np.maximum(action_high - action_low, 1e-8)
+
+        orig_norm = 2.0 * (orig_arr - action_low) / denom - 1.0
+        skip_norm = 2.0 * (skip_arr - action_low) / denom - 1.0
+
+        orig_norm = np.clip(orig_norm, -1.0, 1.0)
+        skip_norm = np.clip(skip_norm, -1.0, 1.0)
+
+        scale = 0.5 * (n_action_bins - 1)
+        orig_bin_idx = np.rint((orig_norm + 1.0) * scale).astype(np.int32)
+        skip_bin_idx = np.rint((skip_norm + 1.0) * scale).astype(np.int32)
+
+        orig_bin_idx = np.clip(orig_bin_idx, 0, n_action_bins - 1)
+        skip_bin_idx = np.clip(skip_bin_idx, 0, n_action_bins - 1)
+
+        bin_idx_dist = np.abs(orig_bin_idx - skip_bin_idx)
+        metrics["bin_idx_dist_mean"] = float(np.mean(bin_idx_dist))
+        metrics["bin_idx_dist_max"] = float(np.max(bin_idx_dist))
+        metrics["bin_idx_dist_std"] = float(np.std(bin_idx_dist))
 
     return metrics
 
@@ -217,6 +243,28 @@ def test_layer_skipping(
         )
     print(f"✓ Reference actions generated: {len(original_actions)} action steps\n")
 
+    # Prepare action binning metadata for bin-index distance metrics.
+    action_low = None
+    action_high = None
+    n_action_bins = None
+    try:
+        action_stats = vla.get_action_stats(cfg.unnorm_key)
+        if "q01" in action_stats and "q99" in action_stats:
+            action_low = np.array(action_stats["q01"])
+            action_high = np.array(action_stats["q99"])
+        elif "min" in action_stats and "max" in action_stats:
+            action_low = np.array(action_stats["min"])
+            action_high = np.array(action_stats["max"])
+
+        n_action_bins = int(getattr(vla.config, "n_action_bins", 0))
+        if action_low is None or action_high is None or n_action_bins <= 1:
+            action_low, action_high, n_action_bins = None, None, None
+            print("Bin-index distance disabled: missing action stats or n_action_bins <= 1")
+        else:
+            print(f"Bin-index distance enabled: n_action_bins={n_action_bins}")
+    except Exception as exc:
+        print(f"Bin-index distance disabled: failed to read action bin metadata ({exc})")
+
     # Test each contiguous layer range; always-included layers are added to every candidate.
     results = []
     if not skip_ranges:
@@ -252,7 +300,13 @@ def test_layer_skipping(
                 )
 
         # Compute metrics
-        metrics = compute_action_metrics(original_actions, skipped_actions)
+        metrics = compute_action_metrics(
+            original_actions,
+            skipped_actions,
+            action_low=action_low,
+            action_high=action_high,
+            n_action_bins=n_action_bins,
+        )
 
         result = {
             "num_skip_layers": num_skip,
@@ -268,6 +322,11 @@ def test_layer_skipping(
         print(f"{status}")
         print(f"  L2 distance: mean={metrics['l2_mean']:.6f}, max={metrics['l2_max']:.6f}, std={metrics['l2_std']:.6f}")
         print(f"  Value diff:  mean={metrics['value_diff_mean']:.6f}, max={metrics['value_diff_max']:.6f}")
+        if "bin_idx_dist_mean" in metrics:
+            print(
+                f"  Bin distance: mean={metrics['bin_idx_dist_mean']:.6f}, "
+                f"max={metrics['bin_idx_dist_max']:.6f}, std={metrics['bin_idx_dist_std']:.6f}"
+            )
         if metrics["anomalies"]:
             print(
                 f"  ⚠ Anomalies: NaN={metrics['has_nan']}, Inf={metrics['has_inf']}, Extremes={metrics['has_extremes']}"
@@ -278,20 +337,26 @@ def test_layer_skipping(
     print("\n" + "=" * 80)
     print("SUMMARY TABLE (sorted by L2 distance)")
     print("=" * 80)
-    print(f"{'Range':<15} {'Search#':<8} {'Total#':<8} {'L2 Mean':<15} {'L2 Max':<15} {'Mean Diff':<15} {'Anomalies':<10}")
+    print(
+        f"{'Range':<15} {'Search#':<8} {'Total#':<8} {'L2 Mean':<12} {'L2 Max':<12} "
+        f"{'Bin Mean':<10} {'Bin Max':<10} {'Anomalies':<10}"
+    )
     print("-" * 80)
 
     sorted_results = sorted(results, key=lambda x: x["l2_mean"])
     for result in sorted_results:
         range_str = result["skip_layer_range"]
         anom_str = "YES" if result["anomalies"] else "no"
+        bin_mean_str = f"{result['bin_idx_dist_mean']:.6f}" if "bin_idx_dist_mean" in result else "n/a"
+        bin_max_str = f"{result['bin_idx_dist_max']:.6f}" if "bin_idx_dist_max" in result else "n/a"
         print(
             f"{range_str:<15} "
             f"{result['search_skip_layers']:<8} "
             f"{result['num_skip_layers']:<8} "
-            f"{result['l2_mean']:<15.6f} "
-            f"{result['l2_max']:<15.6f} "
-            f"{result['value_diff_mean']:<15.6f} "
+            f"{result['l2_mean']:<12.6f} "
+            f"{result['l2_max']:<12.6f} "
+            f"{bin_mean_str:<10} "
+            f"{bin_max_str:<10} "
             f"{anom_str:<10}"
         )
 
@@ -315,6 +380,9 @@ def test_layer_skipping(
                     "l2_std",
                     "value_diff_mean",
                     "value_diff_max",
+                    "bin_idx_dist_mean",
+                    "bin_idx_dist_max",
+                    "bin_idx_dist_std",
                     "anomalies",
                     "has_nan",
                     "has_inf",
@@ -351,6 +419,9 @@ def test_layer_skipping(
                         result["l2_std"],
                         result["value_diff_mean"],
                         result["value_diff_max"],
+                        result.get("bin_idx_dist_mean", ""),
+                        result.get("bin_idx_dist_max", ""),
+                        result.get("bin_idx_dist_std", ""),
                         result["anomalies"],
                         result["has_nan"],
                         result["has_inf"],

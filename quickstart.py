@@ -52,4 +52,5 @@ for act in actions:
 
 # ===== Run Layer Skipping Test =====
 # Uncomment the line below to run the self-speculative decoding layer skipping test
-test_layer_skipping(vla, cfg, processor, observation, proprio_projector)
+test_layer_skipping(vla, cfg, processor, observation, proprio_projector, always_exclude_layers={0, 31},
+                    always_include_layers={25})
