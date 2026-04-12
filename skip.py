@@ -35,7 +35,7 @@ def patch_layer_skipping(vla: torch.nn.Module, skip_layer_indices: set):
 
     try:
         # Get the decoder layers from the LLaMA model
-        decoder_layers = vla.llm.model.layers
+        decoder_layers = vla.language_model.model.layers
 
         # Install hooks on each layer to be skipped
         for layer_idx in skip_layer_indices:
@@ -129,7 +129,7 @@ def test_layer_skipping(
         max_skip_layers: Maximum number of layers to skip (default: all layers)
     """
     # Get number of decoder layers
-    num_decoder_layers = len(vla.llm.model.layers)
+    num_decoder_layers = len(vla.language_model.model.layers)
     if max_skip_layers is None:
         max_skip_layers = num_decoder_layers
 
