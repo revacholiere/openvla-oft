@@ -7,7 +7,7 @@ opportunities for inference-time speedups via speculative decoding.
 """
 
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -47,11 +47,11 @@ def patch_layer_skipping(vla: torch.nn.Module, skip_layer_indices: set):
                     # LlamaDecoderLayer output is a tuple: (hidden_states, next_cache, [attentions])
                     # We return input hidden_states but keep the cache structure from output
                     # This implements residual: skip the layer computation, pass hidden states through
-                    return (inputs[0],) + output[1:]
+                    return (inputs[0], *output[1:])
 
                 return skip_forward
 
-              # Register forward hook (runs after forward pass but replaces the output)
+            # Register forward hook (runs after forward pass but replaces the output)
             handle = layer.register_forward_hook(make_skip_hook())
             handles.append(handle)
 
@@ -107,6 +107,16 @@ def compute_action_metrics(
     return metrics
 
 
+def build_contiguous_skip_ranges(num_layers: int, max_skip_layers: int) -> List[Tuple[int, int]]:
+    """Build all contiguous layer ranges [start, end] subject to max skipped length."""
+    ranges: List[Tuple[int, int]] = []
+    for start_idx in range(num_layers):
+        max_end = min(num_layers - 1, start_idx + max_skip_layers - 1)
+        for end_idx in range(start_idx, max_end + 1):
+            ranges.append((start_idx, end_idx))
+    return ranges
+
+
 def test_layer_skipping(
     vla: torch.nn.Module,
     cfg: GenerateConfig,
@@ -118,7 +128,8 @@ def test_layer_skipping(
     """
     Test the effects of skipping consecutive decoder layers on action output.
 
-    Tests skipping the last N layers for N in [1, 2, 3, ..., max_skip_layers].
+    Tests all contiguous layer ranges [start, end], i.e., skip layers start..end.
+    Example ranges include [0, 0], [0, 1], [3, 7], ..., [last, last].
     Reports metrics comparing each skipping pattern to the original model.
 
     Args:
@@ -127,7 +138,7 @@ def test_layer_skipping(
         processor: Image processor
         observation: Sample observation dict
         proprio_projector: Proprioception projector
-        max_skip_layers: Maximum number of layers to skip (default: all layers)
+        max_skip_layers: Maximum number of contiguous layers to skip (default: all layers)
     """
     # Get number of decoder layers
     num_decoder_layers = len(vla.language_model.model.layers)
@@ -139,7 +150,10 @@ def test_layer_skipping(
     print("=" * 80)
     print(f"Model: {cfg.pretrained_checkpoint}")
     print(f"Total decoder layers: {num_decoder_layers}")
-    print(f"Testing skip patterns: last 1 to last {max_skip_layers} layers")
+    print(f"Testing contiguous skip lengths: 1 to {max_skip_layers} layers")
+
+    skip_ranges = build_contiguous_skip_ranges(num_decoder_layers, max_skip_layers)
+    print(f"Total skip ranges to evaluate: {len(skip_ranges)}")
     print("=" * 80 + "\n")
 
     # Generate reference actions with full model
@@ -150,12 +164,17 @@ def test_layer_skipping(
         )
     print(f"✓ Reference actions generated: {len(original_actions)} action steps\n")
 
-    # Test each consecutive layer skip pattern
+    # Test each contiguous layer range
     results = []
-    for num_skip in range(1, max_skip_layers + 1):
-        skip_layers = set(range(num_decoder_layers - num_skip, num_decoder_layers))
+    for range_idx, (start_idx, end_idx) in enumerate(skip_ranges, start=1):
+        skip_layers = set(range(start_idx, end_idx + 1))
+        num_skip = end_idx - start_idx + 1
 
-        print(f"Testing: Skip last {num_skip} layer(s) (indices {min(skip_layers)}-{max(skip_layers)})...", end=" ")
+        print(
+            f"Testing [{range_idx}/{len(skip_ranges)}]: "
+            f"Skip layers {start_idx}-{end_idx} ({num_skip} layer(s))...",
+            end=" ",
+        )
 
         with torch.inference_mode():
             with patch_layer_skipping(vla, skip_layers):
@@ -171,7 +190,13 @@ def test_layer_skipping(
         # Compute metrics
         metrics = compute_action_metrics(original_actions, skipped_actions)
 
-        result = {"num_skip_layers": num_skip, "skip_layer_range": f"{min(skip_layers)}-{max(skip_layers)}", **metrics}
+        result = {
+            "num_skip_layers": num_skip,
+            "start_layer": start_idx,
+            "end_layer": end_idx,
+            "skip_layer_range": f"{start_idx}-{end_idx}",
+            **metrics,
+        }
         results.append(result)
 
         status = "✓" if not metrics["anomalies"] else "⚠ ANOMALY"
@@ -188,18 +213,18 @@ def test_layer_skipping(
     print("\n" + "=" * 80)
     print("SUMMARY TABLE (sorted by L2 distance)")
     print("=" * 80)
-    print(f"{'Skip Layers':<15} {'L2 Mean':<15} {'L2 Max':<15} {'L2 Std':<15} {'Mean Diff':<15} {'Anomalies':<10}")
+    print(f"{'Range':<15} {'#Skipped':<10} {'L2 Mean':<15} {'L2 Max':<15} {'Mean Diff':<15} {'Anomalies':<10}")
     print("-" * 80)
 
     sorted_results = sorted(results, key=lambda x: x["l2_mean"])
     for result in sorted_results:
-        skip_str = f"last {result['num_skip_layers']}"
+        range_str = f"{result['start_layer']}-{result['end_layer']}"
         anom_str = "YES" if result["anomalies"] else "no"
         print(
-            f"{skip_str:<15} "
+            f"{range_str:<15} "
+            f"{result['num_skip_layers']:<10} "
             f"{result['l2_mean']:<15.6f} "
             f"{result['l2_max']:<15.6f} "
-            f"{result['l2_std']:<15.6f} "
             f"{result['value_diff_mean']:<15.6f} "
             f"{anom_str:<10}"
         )
@@ -208,7 +233,10 @@ def test_layer_skipping(
 
     # Best pattern analysis
     best_result = sorted_results[0]
-    print(f"Best pattern: Skip last {best_result['num_skip_layers']} layers")
+    print(
+        f"Best pattern: Skip layers {best_result['start_layer']}-{best_result['end_layer']} "
+        f"({best_result['num_skip_layers']} layers)"
+    )
     print(f"  L2 distance: {best_result['l2_mean']:.6f} (mean), {best_result['l2_max']:.6f} (max)")
     print(
         f"  Speed improvement potential: ~{100 * best_result['num_skip_layers'] / num_decoder_layers:.1f}% of decoder compute"
