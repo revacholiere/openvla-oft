@@ -30,7 +30,7 @@ vla = get_vla(cfg)
 processor = get_processor(cfg)
 
 # Load MLP action head to generate continuous actions (via L1 regression)
-action_head = get_action_head(cfg, llm_dim=vla.llm_dim)
+#action_head = get_action_head(cfg, llm_dim=vla.llm_dim)
 
 # Load proprio projector to map proprio to language embedding space
 proprio_projector = get_proprio_projector(cfg, llm_dim=vla.llm_dim, proprio_dim=PROPRIO_DIM)
@@ -46,7 +46,10 @@ with open("experiments/robot/libero/sample_libero_spatial_observation.pkl", "rb"
     observation = pickle.load(file)
 
 # Generate robot action chunk (sequence of future actions)
-actions = get_vla_action(cfg, vla, processor, observation, observation["task_description"], action_head, proprio_projector)
+actions = get_vla_action(
+    cfg, vla, processor, observation, observation["task_description"],
+    proprio_projector=proprio_projector
+)
 print("Generated action chunk:")
 for act in actions:
     print(act)
