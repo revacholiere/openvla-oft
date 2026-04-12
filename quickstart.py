@@ -13,7 +13,7 @@ from prismatic.vla.constants import NUM_ACTIONS_CHUNK, PROPRIO_DIM
 # Instantiate config (see class GenerateConfig in experiments/robot/libero/run_libero_eval.py for definitions)
 cfg = GenerateConfig(
     pretrained_checkpoint = "moojink/openvla-7b-oft-finetuned-libero-spatial",
-    use_l1_regression = True,
+    use_l1_regression = False,
     use_diffusion = False,
     use_film = False,
     num_images_in_input = 2,
