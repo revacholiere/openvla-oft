@@ -6,8 +6,10 @@ Useful for measuring which decoder layers are critical for task performance and 
 opportunities for inference-time speedups via speculative decoding.
 """
 
+import csv
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import torch
@@ -107,13 +109,36 @@ def compute_action_metrics(
     return metrics
 
 
-def build_contiguous_skip_ranges(num_layers: int, max_skip_layers: int) -> List[Tuple[int, int]]:
-    """Build all contiguous layer ranges [start, end] subject to max skipped length."""
+def _build_contiguous_segments(layer_indices: List[int]) -> List[List[int]]:
+    """Split sorted indices into contiguous segments in index space."""
+    if not layer_indices:
+        return []
+
+    segments: List[List[int]] = []
+    current_segment: List[int] = [layer_indices[0]]
+    for idx in layer_indices[1:]:
+        if idx == current_segment[-1] + 1:
+            current_segment.append(idx)
+        else:
+            segments.append(current_segment)
+            current_segment = [idx]
+    segments.append(current_segment)
+    return segments
+
+
+def build_contiguous_skip_ranges(searchable_layers: List[int], max_skip_layers: int) -> List[Tuple[int, int]]:
+    """
+    Build all contiguous layer ranges [start, end] inside searchable layers.
+
+    Contiguity is defined in model index space (e.g. 5-7 is contiguous; 5-7 and 9-10 are separate segments).
+    """
     ranges: List[Tuple[int, int]] = []
-    for start_idx in range(num_layers):
-        max_end = min(num_layers - 1, start_idx + max_skip_layers - 1)
-        for end_idx in range(start_idx, max_end + 1):
-            ranges.append((start_idx, end_idx))
+    for segment in _build_contiguous_segments(searchable_layers):
+        seg_len = len(segment)
+        for start_pos in range(seg_len):
+            max_end_pos = min(seg_len - 1, start_pos + max_skip_layers - 1)
+            for end_pos in range(start_pos, max_end_pos + 1):
+                ranges.append((segment[start_pos], segment[end_pos]))
     return ranges
 
 
@@ -124,6 +149,9 @@ def test_layer_skipping(
     observation: Dict,
     proprio_projector: Any,
     max_skip_layers: Optional[int] = None,
+    always_exclude_layers: Optional[Set[int]] = None,
+    always_include_layers: Optional[Set[int]] = None,
+    csv_output_path: Optional[str] = "layer_skip_results.csv",
 ) -> None:
     """
     Test the effects of skipping consecutive decoder layers on action output.
@@ -139,11 +167,33 @@ def test_layer_skipping(
         observation: Sample observation dict
         proprio_projector: Proprioception projector
         max_skip_layers: Maximum number of contiguous layers to skip (default: all layers)
+        always_exclude_layers: Layers that are never skipped by the search
+        always_include_layers: Layers that are always skipped for every candidate
+        csv_output_path: CSV output path. Set to None to disable CSV writing.
     """
     # Get number of decoder layers
     num_decoder_layers = len(vla.language_model.model.layers)
     if max_skip_layers is None:
         max_skip_layers = num_decoder_layers
+
+    always_exclude_layers = set(always_exclude_layers or set())
+    always_include_layers = set(always_include_layers or set())
+
+    # Validate layer indices and sanitize overlap: include takes precedence over exclude
+    valid_layer_set = set(range(num_decoder_layers))
+    invalid_excludes = sorted(always_exclude_layers - valid_layer_set)
+    invalid_includes = sorted(always_include_layers - valid_layer_set)
+    if invalid_excludes or invalid_includes:
+        raise ValueError(
+            f"Invalid layer indices. excludes={invalid_excludes}, includes={invalid_includes}, "
+            f"valid=0..{num_decoder_layers - 1}"
+        )
+
+    overlap = always_exclude_layers & always_include_layers
+    if overlap:
+        always_exclude_layers -= overlap
+
+    searchable_layers = sorted(valid_layer_set - always_exclude_layers - always_include_layers)
 
     print("\n" + "=" * 80)
     print("SELF-SPECULATIVE DECODING: LAYER SKIPPING TEST")
@@ -151,8 +201,11 @@ def test_layer_skipping(
     print(f"Model: {cfg.pretrained_checkpoint}")
     print(f"Total decoder layers: {num_decoder_layers}")
     print(f"Testing contiguous skip lengths: 1 to {max_skip_layers} layers")
+    print(f"Always-excluded layers: {sorted(always_exclude_layers) if always_exclude_layers else 'None'}")
+    print(f"Always-included layers: {sorted(always_include_layers) if always_include_layers else 'None'}")
+    print(f"Searchable layers: {searchable_layers if searchable_layers else 'None'}")
 
-    skip_ranges = build_contiguous_skip_ranges(num_decoder_layers, max_skip_layers)
+    skip_ranges = build_contiguous_skip_ranges(searchable_layers, max_skip_layers)
     print(f"Total skip ranges to evaluate: {len(skip_ranges)}")
     print("=" * 80 + "\n")
 
@@ -164,15 +217,26 @@ def test_layer_skipping(
         )
     print(f"✓ Reference actions generated: {len(original_actions)} action steps\n")
 
-    # Test each contiguous layer range
+    # Test each contiguous layer range; always-included layers are added to every candidate.
     results = []
+    if not skip_ranges:
+        skip_ranges = [(-1, -1)]
+
     for range_idx, (start_idx, end_idx) in enumerate(skip_ranges, start=1):
-        skip_layers = set(range(start_idx, end_idx + 1))
-        num_skip = end_idx - start_idx + 1
+        range_layers = set() if start_idx == -1 else set(range(start_idx, end_idx + 1))
+        skip_layers = always_include_layers | range_layers
+        num_skip = len(skip_layers)
+
+        if start_idx == -1:
+            range_desc = "none"
+            search_skip_count = 0
+        else:
+            range_desc = f"{start_idx}-{end_idx}"
+            search_skip_count = end_idx - start_idx + 1
 
         print(
             f"Testing [{range_idx}/{len(skip_ranges)}]: "
-            f"Skip layers {start_idx}-{end_idx} ({num_skip} layer(s))...",
+            f"Search range {range_desc} ({search_skip_count} layer(s)); total skipped {num_skip}...",
             end=" ",
         )
 
@@ -194,7 +258,8 @@ def test_layer_skipping(
             "num_skip_layers": num_skip,
             "start_layer": start_idx,
             "end_layer": end_idx,
-            "skip_layer_range": f"{start_idx}-{end_idx}",
+            "skip_layer_range": range_desc,
+            "search_skip_layers": search_skip_count,
             **metrics,
         }
         results.append(result)
@@ -213,16 +278,17 @@ def test_layer_skipping(
     print("\n" + "=" * 80)
     print("SUMMARY TABLE (sorted by L2 distance)")
     print("=" * 80)
-    print(f"{'Range':<15} {'#Skipped':<10} {'L2 Mean':<15} {'L2 Max':<15} {'Mean Diff':<15} {'Anomalies':<10}")
+    print(f"{'Range':<15} {'Search#':<8} {'Total#':<8} {'L2 Mean':<15} {'L2 Max':<15} {'Mean Diff':<15} {'Anomalies':<10}")
     print("-" * 80)
 
     sorted_results = sorted(results, key=lambda x: x["l2_mean"])
     for result in sorted_results:
-        range_str = f"{result['start_layer']}-{result['end_layer']}"
+        range_str = result["skip_layer_range"]
         anom_str = "YES" if result["anomalies"] else "no"
         print(
             f"{range_str:<15} "
-            f"{result['num_skip_layers']:<10} "
+            f"{result['search_skip_layers']:<8} "
+            f"{result['num_skip_layers']:<8} "
             f"{result['l2_mean']:<15.6f} "
             f"{result['l2_max']:<15.6f} "
             f"{result['value_diff_mean']:<15.6f} "
@@ -231,13 +297,66 @@ def test_layer_skipping(
 
     print("=" * 80 + "\n")
 
+    if csv_output_path:
+        csv_path = Path(csv_output_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "run_idx",
+                    "start_idx",
+                    "end_idx",
+                    "skip_range",
+                    "search_skip_layers",
+                    "total_skip_layers",
+                    "l2_mean",
+                    "l2_max",
+                    "l2_std",
+                    "value_diff_mean",
+                    "value_diff_max",
+                    "anomalies",
+                    "has_nan",
+                    "has_inf",
+                    "has_extremes",
+                    "always_exclude_layers",
+                    "always_include_layers",
+                ]
+            )
+
     # Best pattern analysis
     best_result = sorted_results[0]
-    print(
-        f"Best pattern: Skip layers {best_result['start_layer']}-{best_result['end_layer']} "
-        f"({best_result['num_skip_layers']} layers)"
-    )
+    print(f"Best search range: {best_result['skip_layer_range']}")
+    print(f"  Search-skipped layers: {best_result['search_skip_layers']}")
+    print(f"  Total skipped layers (including always-included): {best_result['num_skip_layers']}")
     print(f"  L2 distance: {best_result['l2_mean']:.6f} (mean), {best_result['l2_max']:.6f} (max)")
     print(
         f"  Speed improvement potential: ~{100 * best_result['num_skip_layers'] / num_decoder_layers:.1f}% of decoder compute"
     )
+
+    if csv_output_path:
+        with Path(csv_output_path).open("a", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            for idx, result in enumerate(sorted_results, start=1):
+                writer.writerow(
+                    [
+                        idx,
+                        result["start_layer"],
+                        result["end_layer"],
+                        result["skip_layer_range"],
+                        result["search_skip_layers"],
+                        result["num_skip_layers"],
+                        result["l2_mean"],
+                        result["l2_max"],
+                        result["l2_std"],
+                        result["value_diff_mean"],
+                        result["value_diff_max"],
+                        result["anomalies"],
+                        result["has_nan"],
+                        result["has_inf"],
+                        result["has_extremes"],
+                        "|".join(map(str, sorted(always_exclude_layers))),
+                        "|".join(map(str, sorted(always_include_layers))),
+                    ]
+                )
+        print(f"Saved CSV results: {csv_output_path}")
