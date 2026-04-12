@@ -44,13 +44,14 @@ def patch_layer_skipping(vla: torch.nn.Module, skip_layer_indices: set):
             # Create a hook that returns the input unchanged (residual skip)
             def make_skip_hook():
                 def skip_forward(module, inputs, output):
-                    # inputs is a tuple, first element is hidden states
-                    # We want to return it unchanged to skip computation
-                    return inputs[0]  # Return hidden states directly (residual)
+                    # LlamaDecoderLayer output is a tuple: (hidden_states, next_cache, [attentions])
+                    # We return input hidden_states but keep the cache structure from output
+                    # This implements residual: skip the layer computation, pass hidden states through
+                    return (inputs[0],) + output[1:]
 
                 return skip_forward
 
-            # Register forward hook (runs after forward pass)
+              # Register forward hook (runs after forward pass but replaces the output)
             handle = layer.register_forward_hook(make_skip_hook())
             handles.append(handle)
 
