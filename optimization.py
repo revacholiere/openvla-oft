@@ -384,7 +384,11 @@ class GreedyLayerSkipOptimizer:
         self.search_space = BaseLayerSkipOptimizer._normalize_and_validate_search_space(search_space)
         self.metric_name = metric_name
 
-    def _objective_and_reward(self, skip_layers: Set[int], metrics: Dict[str, float]) -> Tuple[Dict[str, float], float, float, int]:
+    def _objective_and_reward(
+        self,
+        skip_layers: Set[int],
+        metrics: Dict[str, float],
+    ) -> Tuple[Dict[str, float], float, float, int]:
         if self.metric_name not in metrics:
             raise KeyError(
                 f"Metric '{self.metric_name}' missing from evaluator output. "
@@ -398,12 +402,13 @@ class GreedyLayerSkipOptimizer:
         reward = -objective_value
         return objectives, objective_value, reward, active_layers
 
-    def run(self, evaluator: LayerSkipEvaluator) -> OptimizationResult:
+    def run(self, evaluator: LayerSkipEvaluator, verbose: bool = False) -> OptimizationResult:
         current_skip_layers = set(self.search_space.always_include_layers)
         searchable_layers = [
             layer
             for layer in range(self.search_space.num_layers)
-            if layer not in self.search_space.always_exclude_layers and layer not in self.search_space.always_include_layers
+            if layer not in self.search_space.always_exclude_layers
+            and layer not in self.search_space.always_include_layers
         ]
 
         history: List[TrialRecord] = []
@@ -424,6 +429,11 @@ class GreedyLayerSkipOptimizer:
                 reward=reward,
             )
         )
+        if verbose:
+            print(
+                f"step=00 baseline active={active_layers:02d} "
+                f"{self.metric_name}={objective_value:.6f}"
+            )
 
         iteration = 1
         remaining_layers = [layer for layer in searchable_layers if layer not in current_skip_layers]
@@ -469,6 +479,11 @@ class GreedyLayerSkipOptimizer:
                     reward=best_reward,
                 )
             )
+            if verbose:
+                print(
+                    f"step={iteration:02d} chose_layer={best_layer:02d} "
+                    f"active={best_active_layers:02d} {self.metric_name}={best_objective_value:.6f}"
+                )
             iteration += 1
 
         best_trial = min(history, key=lambda trial: trial.objective_value)

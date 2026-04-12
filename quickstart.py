@@ -110,15 +110,16 @@ greedy_search_space = SearchSpaceConfig(
     max_skip_layers=None,
     contiguous_only=False,
 )
-greedy = GreedyLayerSkipOptimizer(search_space=greedy_search_space, metric_name="l2_mean")
-greedy_result = greedy.run(evaluator=evaluator)
+greedy_metric_name = "bin_idx_dist_max"
+greedy = GreedyLayerSkipOptimizer(search_space=greedy_search_space, metric_name=greedy_metric_name)
+greedy_result = greedy.run(evaluator=evaluator, verbose=True)
 
-print(f"Best greedy metric (l2_mean): {greedy_result.best_trial.objective_value:.6f}")
+print(f"Best greedy metric ({greedy_metric_name}): {greedy_result.best_trial.objective_value:.6f}")
 print(f"Best greedy skip layers: {sorted(greedy_result.best_trial.skip_layers)}")
 
 print("\nGreedy timeline:")
 for trial in greedy_result.history:
     print(
         f"step={trial.iteration:02d} active={trial.active_layers:02d} "
-        f"skip={sorted(trial.skip_layers)} l2_mean={trial.metrics['l2_mean']:.6f}"
+        f"skip={sorted(trial.skip_layers)} {greedy_metric_name}={trial.metrics[greedy_metric_name]:.6f}"
     )
