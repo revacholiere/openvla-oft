@@ -384,6 +384,37 @@ class GreedyLayerSkipOptimizer:
         self.search_space = BaseLayerSkipOptimizer._normalize_and_validate_search_space(search_space)
         self.metric_name = metric_name
 
+    @staticmethod
+    def _format_metrics_for_log(metrics: Dict[str, float]) -> str:
+        preferred_order = [
+            "l2_mean",
+            "l2_max",
+            "value_diff_mean",
+            "value_diff_max",
+            "bin_idx_dist_mean",
+            "bin_idx_dist_max",
+            "bin_idx_dist_std",
+        ]
+
+        items = []
+        used = set()
+        for key in preferred_order:
+            if key in metrics:
+                value = metrics[key]
+                if isinstance(value, (int, float, np.floating, np.integer)):
+                    items.append(f"{key}={float(value):.6f}")
+                    used.add(key)
+
+        # Include any other numeric metrics not in preferred list.
+        for key in sorted(metrics.keys()):
+            if key in used:
+                continue
+            value = metrics[key]
+            if isinstance(value, (int, float, np.floating, np.integer)):
+                items.append(f"{key}={float(value):.6f}")
+
+        return " ".join(items)
+
     def _objective_and_reward(
         self,
         skip_layers: Set[int],
@@ -430,9 +461,10 @@ class GreedyLayerSkipOptimizer:
             )
         )
         if verbose:
+            metrics_str = self._format_metrics_for_log(baseline_metrics)
             print(
                 f"step=00 baseline active={active_layers:02d} "
-                f"{self.metric_name}={objective_value:.6f}"
+                f"{self.metric_name}={objective_value:.6f} {metrics_str}"
             )
 
         iteration = 1
@@ -480,9 +512,10 @@ class GreedyLayerSkipOptimizer:
                 )
             )
             if verbose:
+                metrics_str = self._format_metrics_for_log(best_metrics)
                 print(
                     f"step={iteration:02d} chose_layer={best_layer:02d} "
-                    f"active={best_active_layers:02d} {self.metric_name}={best_objective_value:.6f}"
+                    f"active={best_active_layers:02d} {self.metric_name}={best_objective_value:.6f} {metrics_str}"
                 )
             iteration += 1
 
